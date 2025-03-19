@@ -1,0 +1,364 @@
+#include <Arduino.h>
+#include <U8g2lib.h>
+#include <bitset>
+#include <STM32FreeRTOS.h>
+#include <ES_CAN.h>
+#include "loopTimeMeasurement.h"
+
+#include "pinDefinitions.h"
+
+#include "globalDefinitions.h"
+
+#include "keyReading.h"
+
+
+loopTimeMeasurement ltm("key reading", 100);
+
+int stepSizeGenerator(int index) {
+  float Fs = 22000;
+  float FA = 440*float(pow(2.0, float(octave)-4.0));
+  float factor = pow(2.0, (float) (float(index)-9.0)*(1.0/12.0));
+  float f = FA*factor;
+  int step = int((float) pow(2.0, 32.0)*(f/Fs));
+  return step;
+}
+
+int stepSize(int index, int octaveLocal) {
+  int step = stepSizes[index];
+  int octaveDiff = octaveLocal - 4;
+  if(octaveDiff < 0) step >> -octaveDiff;
+  if(octaveDiff > 0) step << -octaveDiff;
+  return step;
+}
+
+void sampleISR() {
+  int currentStepSize_local = __atomic_load_n(&currentStepSize, __ATOMIC_RELAXED);
+  static uint32_t phaseAcc = 0;
+  phaseAcc += currentStepSize_local;
+  int32_t Vout = (phaseAcc >> 24) - 128;
+  int volume_local = __atomic_load_n(&volume, __ATOMIC_RELAXED);
+  //analogWrite(OUTR_PIN, ((Vout*volume_local*volume_local/64)+128));
+  Vout = Vout >> (8 - volume_local);
+  analogWrite(OUTR_PIN, Vout + 128);
+}
+/*
+int decodeKnob(int previousLegalTransitionEffect, std::bitset<2> prevState, std::bitset<2> currentState) {
+  bool B = currentState[0];
+  bool A = currentState[1];
+  bool pB = prevState[0];
+  bool pA = prevState[1];
+  if((!pB && !pA && !B && A) || (pB && pA && B && !A)) return 1;
+  else if((!pB && pA && !B && !A) || (pB && !pA && B && A)) return -1;
+  else if((pB && pA && !B && !A) || (!pB && !pA && B && A)) return previousLegalTransitionEffect;
+  else return 0;
+}
+*/
+
+class knobClass {
+  private:
+    SemaphoreHandle_t mutex;
+    bool prevB = false, prevA = false;
+    int prevAction = 0;
+    bool used;
+
+  public:
+    knobClass() {
+      mutex = xSemaphoreCreateMutex();
+    }
+
+    void decodeKnob(bool A, bool B) {
+      if (xSemaphoreTake(mutex, portMAX_DELAY)) {
+        int action = 0;
+        if((!prevB && !prevA && !B && A) || (prevB && prevA && B && !A)) action = 1;
+        else if((!prevB && prevA && !B && !A) || (prevB && !prevA && B && A)) action = -1;
+        //else if((prevB && prevA && !B && !A) || (!prevB && !prevA && B && A)) action = prevAction;
+        else if(prevB != B && prevA != A) action = prevAction;
+        else action = 0;
+
+        if(action!=0) {
+          prevAction = action;
+          used = false;
+        }
+        prevB = B;
+        prevA = A;
+        xSemaphoreGive(mutex);
+      }
+    }
+
+    int getAction() {
+      int output = 0;
+      if (xSemaphoreTake(mutex, portMAX_DELAY)) {
+        output = int(!used) * prevAction;
+        used = true;
+        xSemaphoreGive(mutex);
+      }
+      return output;
+    }
+};
+/*
+int decodeKnob(int previousLegalTransitionEffect, bool pB, bool pA, bool B, bool A) {
+  if((!pB && !pA && !B && A) || (pB && pA && B && !A)) return 1;
+  else if((!pB && pA && !B && !A) || (pB && !pA && B && A)) return -1;
+  else if((pB && pA && !B && !A) || (!pB && !pA && B && A)) return previousLegalTransitionEffect;
+  else return 0;
+}
+*/
+HardwareTimer sampleTimer(TIM1);
+
+struct {
+  std::bitset<32> inputs;
+  SemaphoreHandle_t mutex; 
+} sysState;
+
+void sysStateTake() {
+  xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+}
+
+void sysStateGive() {
+  xSemaphoreGive(sysState.mutex);
+}
+
+void decodeKnobs(std::bitset<8> vals) {
+  //knobs
+  /*
+  static std::bitset<2> knob0prev_BA;
+  static std::bitset<2> knob1prev_BA;
+  static std::bitset<2> knob2prev_BA;
+  static std::bitset<2> knob3prev_BA;
+  static int prevAction[4] = [0, 0, 0, 0];
+  int knob3Action = decodeKnob(prevAction, knob3prev_BA[0], knob3prev_BA);
+  */
+  static knobClass knob0, knob1, knob2, knob3;
+  knob0.decodeKnob(vals[0], vals[1]);
+  knob1.decodeKnob(vals[2], vals[3]);
+  knob2.decodeKnob(vals[4], vals[5]);
+  knob3.decodeKnob(vals[6], vals[7]);
+
+  int knob3action = knob3.getAction();
+  int volume_local = __atomic_load_n(&volume, __ATOMIC_RELAXED);
+  volume_local = constrain(volume_local+knob3action, 0, 8);
+  __atomic_store_n(&volume, volume_local, __ATOMIC_RELAXED);
+
+}
+
+void addMessageToQueue(char command, byte keyIndex, byte octaveIndex) {
+  //for now no queue is implemented, just assigning.
+  TX_Message[0] = int(command);
+  TX_Message[1] = keyIndex;
+  TX_Message[2] = octaveIndex;
+
+  CAN_TX(0x123, TX_Message);
+}
+
+TaskHandle_t scanKeysHandle = NULL;
+void scanKeysTask(void * pvParameters) {
+  const TickType_t xFrequency = 20/portTICK_PERIOD_MS;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  while(1) {
+    vTaskDelayUntil( &xLastWakeTime, xFrequency );
+    ltm.run1();
+
+    std::bitset<32> sysState_inputs_local;
+    for (int i = 0; i < 8; i++) {
+      std::bitset<4> rowInputs = readRow(i);
+      for(int j = 0; j < 4; j++) sysState_inputs_local[i*4+j] = rowInputs[j];
+    }
+
+    //keys decoding
+    /*
+    int currentStepSize_local = 0;
+    int currentKeyIndex_local = -1;
+    for(int i = 0; i < 12; i++) {
+      if(sysState_inputs_local[i] == true) {
+        currentStepSize_local = stepSizes[i];
+        currentKeyIndex_local = i;
+      }
+    }
+      */
+    std::bitset<8> knobABs;
+    knobABs[0] = sysState_inputs_local[18];
+    knobABs[1] = sysState_inputs_local[19];
+    knobABs[2] = sysState_inputs_local[16];
+    knobABs[3] = sysState_inputs_local[17];
+    knobABs[4] = sysState_inputs_local[14];
+    knobABs[5] = sysState_inputs_local[15];
+    knobABs[6] = sysState_inputs_local[12];
+    knobABs[7] = sysState_inputs_local[13];
+    decodeKnobs(knobABs);
+
+    sysStateTake();
+    for(int i = 0; i < 32; i++) {
+      if(i < 12) {
+        if(!sysState.inputs[i] && sysState_inputs_local[i]) addMessageToQueue('P', i, octave);
+        if(sysState.inputs[i] && !sysState_inputs_local[i]) addMessageToQueue('R', i, octave);
+      }
+      sysState.inputs[i] = sysState_inputs_local[i];
+    }
+    sysStateGive();
+
+    //__atomic_store_n(&currentStepSize, currentStepSize_local, __ATOMIC_RELAXED);
+    //__atomic_store_n(&currentKeyIndex, currentKeyIndex_local, __ATOMIC_RELAXED);
+
+    ltm.run2();
+  }
+}
+
+
+TaskHandle_t displayUpdateHandle = NULL;
+void displayUpdateTask(void * pvParameters) {
+  const TickType_t xFrequency = 100/portTICK_PERIOD_MS;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  while(1) {
+    vTaskDelayUntil( &xLastWakeTime, xFrequency );
+
+    //Update display
+    u8g2.clearBuffer();         // clear the internal memory
+    u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
+    u8g2.drawStr(2,10,"Hello World! :0");  // write something to the internal memory
+    u8g2.setCursor(2,20);
+    //u8g2.print(inputs.to_ulong(),HEX); 
+    int currentKeyIndex_local = __atomic_load_n(&currentKeyIndex, __ATOMIC_RELAXED);
+    if(currentKeyIndex_local == -1) u8g2.print("-"); 
+    else u8g2.print((keyNames[currentKeyIndex]).c_str()); 
+    int volume_local = __atomic_load_n(&volume, __ATOMIC_RELAXED);
+    //u8g2.setCursor(2,20);
+    u8g2.drawStr(2, 30, (std::to_string(volume_local)).c_str()); 
+
+    u8g2.setCursor(66,30);
+    
+    u8g2.print((char) RX_Message[0]);
+    u8g2.print(RX_Message[1]);
+    u8g2.print(RX_Message[2]);
+    
+    u8g2.sendBuffer();          // transfer internal memory to the display
+    //Serial.println(aaaa);
+    //Toggle LED
+    digitalToggle(LED_BUILTIN);
+  }
+}
+
+TaskHandle_t myPrintHandle = NULL;
+void myPrintTask(void *pvParameters) {
+  const TickType_t xFrequency = 100/portTICK_PERIOD_MS;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  while (1) {
+      vTaskDelayUntil( &xLastWakeTime, xFrequency );
+      Serial.print("scanKeys stack left: ");
+      Serial.println(uxTaskGetStackHighWaterMark(scanKeysHandle));//__atomic_load_n(&volume, __ATOMIC_RELAXED)); // Get stack usage for this task
+  }
+}
+
+QueueHandle_t msgInQ;
+void CAN_RX_ISR (void) {
+	uint8_t RX_Message_ISR[8];
+	uint32_t ID;
+	CAN_RX(ID, RX_Message_ISR);
+	xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
+}
+
+TaskHandle_t receiveQueueHandle = NULL;
+void receiveQueueTask(void *pvParameters) {
+  while (1) {
+    xQueueReceive(msgInQ, RX_Message, portMAX_DELAY);
+    if(RX_Message[0] == int('P')) {
+      int currentStepSize_local = stepSize(RX_Message[1], RX_Message[2]);
+      int currentKeyIndex_local = RX_Message[1];
+
+      __atomic_store_n(&currentStepSize, currentStepSize_local, __ATOMIC_RELAXED);
+      __atomic_store_n(&currentKeyIndex, currentKeyIndex_local, __ATOMIC_RELAXED);
+    }
+    if(RX_Message[0] == int('R')) {
+      int currentStepSize_local = 0;
+      int currentKeyIndex_local = RX_Message[1];
+
+      __atomic_store_n(&currentStepSize, currentStepSize_local, __ATOMIC_RELAXED);
+      __atomic_store_n(&currentKeyIndex, currentKeyIndex_local, __ATOMIC_RELAXED);
+    }
+  }
+}
+
+void setup() {
+  // put your setup code here, to run once:
+
+  //Set pin directions
+  pinMode(RA0_PIN, OUTPUT);
+  pinMode(RA1_PIN, OUTPUT);
+  pinMode(RA2_PIN, OUTPUT);
+  pinMode(REN_PIN, OUTPUT);
+  pinMode(OUT_PIN, OUTPUT);
+  pinMode(OUTL_PIN, OUTPUT);
+  pinMode(OUTR_PIN, OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  pinMode(C0_PIN, INPUT);
+  pinMode(C1_PIN, INPUT);
+  pinMode(C2_PIN, INPUT);
+  pinMode(C3_PIN, INPUT);
+  pinMode(JOYX_PIN, INPUT);
+  pinMode(JOYY_PIN, INPUT);
+
+  //Initialise display
+  setOutMuxBit(DRST_BIT, LOW);  //Assert display logic reset
+  delayMicroseconds(2);
+  setOutMuxBit(DRST_BIT, HIGH);  //Release display logic reset
+  u8g2.begin();
+  setOutMuxBit(DEN_BIT, HIGH);  //Enable display power supply
+
+  sampleTimer.setOverflow(22000, HERTZ_FORMAT);
+  sampleTimer.attachInterrupt(sampleISR);
+  sampleTimer.resume();
+
+  //Initialise UART
+  Serial.begin(9600);
+  //while(!Serial){}
+  delay(4000);
+  Serial.println("Hello World");
+
+  for(int i = 0; i < 12; i++) stepSizes[i] = stepSizeGenerator(i);
+
+  for(int i = 0; i < 12; i++) Serial.println(stepSizes[i]);
+
+  CAN_Init(true);
+  CAN_RegisterRX_ISR(CAN_RX_ISR);
+  setCANFilter(0x123,0x7ff);
+  CAN_Start();
+
+  msgInQ = xQueueCreate(36,8);
+
+  xTaskCreate(
+              scanKeysTask,		// Function that implements the task 
+              "scanKeys",		// Text name for the task 
+              128,      		// Stack size in words, not bytes 
+              NULL,			// Parameter passed into the task 
+              3,			// Task priority 
+              &scanKeysHandle );	// Pointer to store the task handle 
+  
+  xTaskCreate(
+              displayUpdateTask,		// Function that implements the task 
+              "displayUpdate",		// Text name for the task 
+              256,      		// Stack size in words, not bytes 
+              NULL,			// Parameter passed into the task 
+              1,			// Task priority 
+              &displayUpdateHandle );	// Pointer to store the task handle 
+  
+  xTaskCreate(
+              myPrintTask,		// Function that implements the task 
+              "myPrint",		// Text name for the task 
+              128,      		// Stack size in words, not bytes 
+              NULL,			// Parameter passed into the task 
+              4,			// Task priority 
+              &myPrintHandle );	// Pointer to store the task handle 
+  xTaskCreate(
+              receiveQueueTask,		// Function that implements the task 
+              "receiveQueue",		// Text name for the task 
+              128,      		// Stack size in words, not bytes 
+              NULL,			// Parameter passed into the task 
+              10,			// Task priority 
+              &receiveQueueHandle );	// Pointer to store the task handle 
+
+  sysState.mutex = xSemaphoreCreateMutex();
+  vTaskStartScheduler();
+}
+
+void loop() {
+}
