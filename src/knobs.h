@@ -1,7 +1,7 @@
 #ifndef KNOBS_H
 #define KNOBS_H
 
-#include "globalDefinitions.h"
+#include "debugDefinitions.h"
 
 QueueHandle_t knobActionQueue;
 
@@ -64,11 +64,15 @@ void decodeKnobs(std::bitset<8> vals) {
 
   bool sendOctaveAction(int action);
 
+  TaskHandle_t knobActionHandle = NULL;
   void knobActionTask(void *pvParameters) {
     KnobActionClass receivedAction;
     
     while (1) {
         if (xQueueReceive(knobActionQueue, &receivedAction, portMAX_DELAY)) {
+            #ifdef PRINT_TIMING
+                KNOB_ACTION_LTM.run1();
+            #endif
             int knobID = receivedAction.knobID;
             int action = receivedAction.action;
 
@@ -76,25 +80,26 @@ void decodeKnobs(std::bitset<8> vals) {
                 case 3:
                     
                     {// adjust volume
-                        int volume_local = __atomic_load_n(&volume, __ATOMIC_RELAXED);
-                        volume_local = constrain(volume_local + action, 0, 8);
-                        __atomic_store_n(&volume, volume_local, __ATOMIC_RELAXED);
+                        volume.add(action);
                     }
                     break;
                     
-                case 1:
-                {
-                    sysStateTake();
-                    int currentWaveform_local = sysState.currentWaveform;
-                    currentWaveform_local = constrain(currentWaveform_local + action, 0, 3);
-                    if (currentWaveform_local != sysState.currentWaveform) {
-                        sysState.currentWaveform = currentWaveform_local;
-                        sendWaveformUpdate(currentWaveform_local); // Inform other boards!
+                case 0:
+                    
+                    {
+
+                        sysStateTake();
+                        int currentWaveform_local = sysState.currentWaveform;
+                        currentWaveform_local = constrain(currentWaveform_local + action, 0, 3);
+                        if (currentWaveform_local != sysState.currentWaveform) {
+                            sysState.currentWaveform = currentWaveform_local;
+                            
+                        }
+                        sysStateGive();
+                        //Serial.print("Waveform changed to: ");
+                        //Serial.println(currentWaveform_local);
+
                     }
-                    sysStateGive();
-                    Serial.print("Waveform changed to: ");
-                    Serial.println(currentWaveform_local);
-                }
                     break;
 
                 case 2:
@@ -102,40 +107,31 @@ void decodeKnobs(std::bitset<8> vals) {
                         bool amTheWestMost_local = __atomic_load_n(&amTheWestMost, __ATOMIC_RELAXED);
                         if (amTheWestMost_local) {
                             if (sendOctaveAction(action)) {
-                                int octave_local = __atomic_load_n(&octave, __ATOMIC_RELAXED);
-                                octave_local += action;
-                                __atomic_store_n(&octave, octave_local, __ATOMIC_RELAXED);
+                                octave.add(action);
                             }
                         }
+                        //Serial.print("send octave change message: ");
+
+                        //Serial.println(octave.get());
                     }
                     break;
                     
-                case 0:
-                    Serial.print("Knob 0 action: ");
-                    Serial.println(action);
+                case 1:
+                    //Serial.print("Knob 1 action: ");
+                    //Serial.println(action);
                     break;
 
                 default:
                     Serial.println("invalid knob ID");
                     break;
             }
+            #ifdef PRINT_TIMING
+                KNOB_ACTION_LTM.run2();
+            #endif
         }
     }
 }
 
-TaskHandle_t knobActionHandle = NULL;
-void knobSetup(UBaseType_t knobActionTask_priority) {
-    knobActionQueue = xQueueCreate(10, sizeof(KnobActionClass));
-    xTaskCreate(
-        knobActionTask,   // Function that implements the task
-        "knobAction",     // Name for debugging
-        256,              // Stack size in words
-        NULL,             // No parameters
-        knobActionTask_priority,         //priority
-        &knobActionHandle              // No handle needed
-    );
-}
-
-
+  
 
 #endif

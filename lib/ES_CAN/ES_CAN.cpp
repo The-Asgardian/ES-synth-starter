@@ -1,4 +1,4 @@
-#include <stm32l4xx_hal.h>
+#include "stm32l4xx_hal.h"
 #include <stm32l4xx_hal_can.h>
 #include <stm32l4xx_hal_rcc.h>
 #include <stm32l4xx_hal_gpio.h>
@@ -113,6 +113,27 @@ uint32_t CAN_TX(uint32_t ID, uint8_t data[8]) {
 
   //Start the transmission
   return (uint32_t) HAL_CAN_AddTxMessage(&CAN_Handle, &txHeader, data, NULL);
+}
+
+uint32_t CAN_TX(uint32_t ID, volatile uint8_t data[8]) {
+
+  //Set up the message header
+  CAN_TxHeaderTypeDef txHeader = {
+    ID & 0x7ff,                 //Standard ID
+    0,                          //Ext ID = 0
+    CAN_ID_STD,                 //Use Standard ID
+    CAN_RTR_DATA,               //Data Frame
+    8,                          //Send 8 bytes
+    DISABLE                     //No time triggered mode
+  };
+
+  //Wait for free mailbox
+  while (!HAL_CAN_GetTxMailboxesFreeLevel(&CAN_Handle));
+
+  //Start the transmission
+  uint8_t data2[8] = {0};
+  for(int i = 0; i < 8; i++) data2[i] = data[i];
+  return (uint32_t) HAL_CAN_AddTxMessage(&CAN_Handle, &txHeader, data2, NULL);
 }
 
 

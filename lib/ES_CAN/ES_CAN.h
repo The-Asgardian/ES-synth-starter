@@ -12,6 +12,7 @@ uint32_t setCANFilter(uint32_t filterID=0, uint32_t maskID=0, uint32_t filterBan
 
 //Send a message
 uint32_t CAN_TX(uint32_t ID, uint8_t data[8]);
+uint32_t CAN_TX(uint32_t ID, volatile uint8_t data[8]);
 
 //Get the number of received messages
 uint32_t CAN_CheckRXLevel();

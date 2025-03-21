@@ -69,22 +69,26 @@ public:
     run();
   }
 
-  void runStartEvent() {
+  void runStartEvent(long timeNow) {
     if (!forbidDifferenceMeasurements) {
       forbidLoopMeasurements = true;
-      time_of_first_event = micros();
+      time_of_first_event = timeNow;
     } 
     else Serial.println("Forbidden difference measurement on: " + String(printName));
   }
 
   void run1() {
-    runStartEvent();
+    runStartEvent(micros());
   }
 
-  void runEndEvent() {
+  void run1(long timeNow) {
+    runStartEvent(timeNow);
+  }
+
+  void runEndEvent(long timeNow) {
     if (!forbidDifferenceMeasurements) {
       forbidLoopMeasurements = true;
-      float time_of_second_event = micros();
+      float time_of_second_event = float(int(timeNow));
       long timeDiff = (time_of_second_event - time_of_first_event);
       if(timeDiff > largestTime) largestTime = timeDiff;
       time_difference_accumulated_sum += (time_of_second_event > time_of_first_event) ? (time_of_second_event - time_of_first_event) : (time_of_first_event - time_of_second_event);
@@ -109,9 +113,23 @@ public:
   }
 
   void run2() {
-    runEndEvent();
+    runEndEvent(micros());
+  }
+
+  void run2(long timeNow) {
+    runEndEvent(timeNow);
   }
 };
+
+
+loopTimeMeasurement KEY_MEASUREMENT_LTM("key reading thread", 100);
+loopTimeMeasurement DISPLAY_LTM("display thread", 20);
+loopTimeMeasurement KNOB_ACTION_LTM("knob action thread", 100);
+loopTimeMeasurement MY_PRINT_LTM("my print thread", 10);
+loopTimeMeasurement CAN_RX_LTM("CAN RX thread", 100); 
+loopTimeMeasurement CAN_TX_LTM("CAN TX thread", 2);
+loopTimeMeasurement SAMPLE_ISR_LTM("SAMPLE ISR", 100000);
+
 
 
 #endif
